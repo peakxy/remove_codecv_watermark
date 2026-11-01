@@ -9,7 +9,8 @@ Supports two watermark generations:
    transparency SMask, drawn on top of all content.  It is detected by
    tracking the CTM through the content stream and removing image draws
    that (a) reference an image with an /SMask and (b) cover (almost) the
-   whole page.
+   whole page. A known CodeCV image can also be identified by verified
+   pixel and alpha-mask fingerprints when it covers less of the page.
 
 Neither path rasterizes the PDF, so original text, layout and page size
 are preserved.
@@ -18,14 +19,22 @@ are preserved.
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
 from typing import Iterable
 
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import ContentStream, DecodedStreamObject, NameObject
+from pypdf.generic import ContentStream, DecodedStreamObject, DictionaryObject, NameObject
 
 
 DEFAULT_OUTPUT_SUFFIX = ".clean.pdf"
+
+# Verified CodeCV transparent overlay, decoded pixels (not compressed bytes).
+# Match both the artwork and alpha mask so ordinary resume images stay intact.
+CODECV_IMAGE_SIZE = (1588, 2246)
+CODECV_IMAGE_SHA256 = "ff3f22fd3eeccce53c94b6fe0cf00c59530452eccbfcfc173af585aaa3c40350"
+CODECV_MASK_SHA256 = "8bc017c2b9656ee24f3438b304f73aaf6a372857fa6c2d6cf8077945bf87a8b0"
+
 
 # How much of the page a transparent image must cover to be considered a
 # watermark overlay (avatars / logos cover only a small fraction).
@@ -39,6 +48,30 @@ MARKING_OPS = {
     b"Tj", b"TJ", b"'", b'"',                            # text showing
     b"BI",                                               # inline image
 }
+
+
+def _is_codecv_image(image) -> bool:
+    image = image.get_object()
+    if (
+        image.get("/Subtype") != "/Image"
+        or (image.get("/Width"), image.get("/Height")) != CODECV_IMAGE_SIZE
+        or image.get("/ColorSpace") != "/DeviceRGB"
+        or image.get("/BitsPerComponent") != 8
+        or "/SMask" not in image
+    ):
+        return False
+    mask = image["/SMask"]
+    if (
+        mask.get("/Subtype") != "/Image"
+        or (mask.get("/Width"), mask.get("/Height")) != CODECV_IMAGE_SIZE
+        or mask.get("/ColorSpace") != "/DeviceGray"
+        or mask.get("/BitsPerComponent") != 8
+    ):
+        return False
+    return (
+        hashlib.sha256(image.get_data()).hexdigest() == CODECV_IMAGE_SHA256
+        and hashlib.sha256(mask.get_data()).hexdigest() == CODECV_MASK_SHA256
+    )
 
 
 def _is_name(value, expected: str) -> bool:
@@ -114,9 +147,14 @@ def _remove_pattern_watermarks(operations) -> tuple[list, set]:
 def _drop_patterns_from_resources(page, removed_patterns: set[str]) -> None:
     if not removed_patterns:
         return
-    resources = page.get("/Resources")
-    patterns = resources.get("/Pattern") if resources else None
+    resources = page["/Resources"] if "/Resources" in page else None
+    patterns = resources["/Pattern"] if resources and "/Pattern" in resources else None
     if patterns:
+        # Resource dictionaries can be shared by multiple pages or forms.
+        resources = DictionaryObject(resources)
+        patterns = DictionaryObject(patterns)
+        page[NameObject("/Resources")] = resources
+        resources[NameObject("/Pattern")] = patterns
         for pattern_name in removed_patterns:
             patterns.pop(NameObject(pattern_name), None)
         if not patterns:
@@ -175,7 +213,7 @@ def _page_xobjects(page) -> dict:
 
 
 def _find_watermark_image_dos(operations, page) -> list[tuple[int, str]]:
-    """Locate ``Do`` ops painting a full-page transparent image overlay."""
+    """Locate full-page transparent overlays or verified CodeCV image draws."""
     xobjects = _page_xobjects(page)
     if not xobjects:
         return []
@@ -184,6 +222,7 @@ def _find_watermark_image_dos(operations, page) -> list[tuple[int, str]]:
     ctm = identity
     stack: list = []
     hits: list[tuple[int, str]] = []
+    verified_images: dict[str, bool] = {}
 
     for index, (operands, operator) in enumerate(operations):
         if operator == b"q":
@@ -204,6 +243,13 @@ def _find_watermark_image_dos(operations, page) -> list[tuple[int, str]]:
                 continue
             if _covers_page(_unit_square_bbox(ctm), page.mediabox):
                 hits.append((index, name))
+            else:
+                # A verified watermark is also safe to remove when its draw
+                # does not meet the full-page coverage threshold.
+                if name not in verified_images:
+                    verified_images[name] = _is_codecv_image(xobject)
+                if verified_images[name]:
+                    hits.append((index, name))
 
     return hits
 
@@ -269,10 +315,14 @@ def _drop_watermark_images_from_resources(page, removed_names: set[str]) -> None
         xobjects = page["/Resources"]["/XObject"].get_object()
     except KeyError:
         return
+    resources = DictionaryObject(page["/Resources"])
+    xobjects = DictionaryObject(xobjects)
+    page[NameObject("/Resources")] = resources
+    resources[NameObject("/XObject")] = xobjects
     for name in removed_names:
         xobjects.pop(NameObject(name), None)
     if not xobjects:
-        page["/Resources"].get_object().pop(NameObject("/XObject"), None)
+        resources.pop(NameObject("/XObject"), None)
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +348,12 @@ def _remove_page_watermark(page, pdf) -> tuple[int, int]:
     if hits:
         operations = _remove_dos_with_blocks(operations, [i for i, _ in hits])
         removed_images = {name for _, name in hits}
-        _drop_watermark_images_from_resources(page, removed_images)
+        # The same image may also have a retained, smaller draw on this page.
+        still_used = {
+            _first_name(operands)
+            for operands, operator in operations if operator == b"Do"
+        }
+        _drop_watermark_images_from_resources(page, removed_images - still_used)
 
     if removed_patterns or removed_images:
         stream.operations = operations
@@ -406,6 +461,8 @@ def main() -> int:
         f"{counts['images']} watermark image(s)."
     )
     print(f"Wrote: {output_pdf}")
+    if not counts["patterns"] and not counts["images"]:
+        print("WARNING: No supported watermark found. The output may still contain watermarks.")
     return 0 if counts["patterns"] or counts["images"] else 1
 
 
